@@ -1,0 +1,1106 @@
+import asyncio
+import os
+import json
+import logging
+import requests
+from typing import List, Dict, Any, TypedDict, Annotated, Optional
+import operator
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import AzureChatOpenAI
+from langchain_community.utilities import GoogleSearchAPIWrapper
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.constants import Send
+from langsmith import traceable
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables from .env file
+load_dotenv()
+
+# ------------------------------------------------------------
+# LLM Setup
+
+# Initialize Azure OpenAI client
+azure_openai = AzureChatOpenAI(
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt4o"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15"),
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
+    temperature=0
+)
+
+# Initialize Google Search API client
+google_search = GoogleSearchAPIWrapper(
+    google_api_key=os.getenv("GOOGLE_API_KEY", ""),
+    google_cse_id=os.getenv("GOOGLE_SEARCH_ENGINE_ID", "")
+)
+
+# ------------------------------------------------------------
+# Type definitions and state management
+
+class SearchQuery(BaseModel):
+    """Search query model"""
+    query: str = Field(description="Search query string")
+
+class SearchResult(BaseModel):
+    """Search result model"""
+    title: str = Field(description="Title of the search result")
+    url: str = Field(description="URL of the search result")
+    snippet: str = Field(description="Snippet/summary of the content")
+    content: Optional[str] = Field(None, description="Full content if available")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class SearchStateInput(TypedDict):
+    """Input state for the search graph"""
+    query: str  # Original user query
+
+class SearchStateOutput(TypedDict):
+    """Output state for the search graph"""
+    response: str  # Final response to user
+    sources: List[Dict[str, Any]]  # Sources used in the response
+
+class SearchState(TypedDict):
+    """State for the search graph"""
+    query: str  # Original user query
+    moderation_result: Dict[str, Any]  # Result of content moderation
+    search_queries: List[SearchQuery]  # Generated search queries
+    search_results: Annotated[List[List[SearchResult]], operator.add]  # Results from search API
+    processed_sources: Annotated[List[Dict[str, Any]], operator.add]  # Processed and ranked sources
+    extracted_content: Annotated[List[Dict[str, Any]], operator.add]  # Extracted content from sources
+    selected_sources: Annotated[List[Dict[str, Any]], operator.add]  # Selected sources by LLM
+    response: Annotated[str, operator.add]  # Final response - annotated to handle parallel updates
+    sources: Annotated[List[Dict[str, Any]], operator.add]  # Sources used in the response - annotated to handle parallel updates
+
+# ------------------------------------------------------------
+# Configuration
+
+class SearchConfig(BaseModel):
+    """Configuration for the search engine"""
+    max_search_queries: int = Field(3, description="Maximum number of search queries to generate")
+    max_results_per_query: int = Field(5, description="Maximum number of results per query")
+    max_sources: int = Field(10, description="Maximum number of sources to use")
+    include_content: bool = Field(True, description="Whether to include full content in results")
+    search_api: str = Field("google", description="Search API to use (google, bing, etc.)")
+    llm_model: str = Field("gpt-4o", description="LLM model to use")
+    temperature: float = Field(0.2, description="Temperature for LLM generation")
+    max_tokens: int = Field(1000, description="Maximum tokens for LLM generation")
+
+# ------------------------------------------------------------
+# Placeholder functions for the search graph
+
+@traceable
+def moderate_content(state: SearchState) -> Dict[str, Any]:
+    """
+    Moderate user query for inappropriate content using Azure OpenAI.
+    
+    Args:
+        state: Current state with user query
+        
+    Returns:
+        Updated state with moderation result
+    """
+    query = state["query"]
+    
+    # System prompt for content moderation
+    system_prompt = """
+    You are a content moderation system. Your task is to analyze the user's query and determine if it contains 
+    inappropriate content that should be blocked. This includes:
+    
+    1. Harmful or illegal content
+    2. Hate speech or discriminatory language
+    3. Explicit sexual content
+    4. Violence or threats
+    5. Personal information requests
+    6. Content that violates ethical guidelines
+    
+    Respond with a JSON object containing:
+    - "is_safe": boolean (true if content is safe, false if it should be blocked)
+    - "categories": object with category names as keys and boolean values
+    - "category_scores": object with category names as keys and float scores (0-1) as values
+    - "reason": string explanation if content is not safe
+    """
+    
+    # Use Azure OpenAI for content moderation
+    try:
+        response = azure_openai.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Analyze this query for inappropriate content: {query}")
+        ])
+        
+        # Parse the response
+        response_content = response.content
+        
+        # For simplicity in this placeholder, we'll assume the response is safe
+        # In a real implementation, you would parse the JSON response from the LLM
+        moderation_result = {
+            "is_safe": True,
+            "categories": {},
+            "category_scores": {},
+            "reason": None
+        }
+        
+        return {
+            "moderation_result": moderation_result
+        }
+        
+    except Exception as e:
+        # Log the error and return a safe default
+        print(f"Error in content moderation: {str(e)}")
+        return {
+            "moderation_result": {
+                "is_safe": False,
+                "categories": {"error": True},
+                "category_scores": {"error": 1.0},
+                "reason": f"Error in moderation: {str(e)}"
+            }
+        }
+
+@traceable
+def generate_search_queries(state: SearchState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Generate search queries based on user query using Azure OpenAI.
+    
+    Args:
+        state: Current state with user query and moderation result
+        config: Configuration for the function
+        
+    Returns:
+        Updated state with generated search queries
+    """
+    query = state["query"]
+    
+    # Extract configuration
+    search_config = config.get("configurable", {})
+    max_search_queries = search_config.get("max_search_queries", 3)
+    
+    # System prompt for search query generation
+    system_prompt = f"""
+    You are an expert search query generator. Your task is to analyze the user's query and generate 
+    {max_search_queries} highly specific and relevant search queries that will help find the most accurate information.
+    
+    Guidelines for generating search queries:
+    1. Create specific, targeted queries that directly address different aspects of the user's question
+    2. For person-related queries, include variations with full name, current year, and professional platforms
+    3. For factual queries, include specific terminology and exact phrasing likely to appear in authoritative sources
+    4. For location or organization queries, include the full official name and relevant qualifiers
+    5. Always include at least one query with the current year (2025) for recency
+    
+    Examples:
+    
+    User query: "where does Sael Al Wary work"
+    Generated queries: [
+        "Sael Al Wary current workplace 2025",
+        "Sael Al Wary job position company",
+        "Sael Al Wary LinkedIn profile"
+    ]
+    
+    User query: "best restaurants in Tokyo"
+    Generated queries: [
+        "top-rated restaurants Tokyo 2025 guide",
+        "Tokyo Michelin star restaurants current list",
+        "best authentic local dining Tokyo recommendations"
+    ]
+    
+    Format your response as a JSON array of query strings. Example:
+    ["query 1", "query 2", "query 3"]
+    
+    Do not include any explanations or other text outside of the JSON array.
+    DO NOT include any other characters besides numbers and commas.
+    """
+    
+    # Use Azure OpenAI for query generation
+    try:
+        response = azure_openai.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"Generate optimized search queries for: {query}")
+        ])
+        
+        # Parse the response
+        response_content = response.content
+        
+        # Log the raw LLM response
+        print(f"Raw LLM response for query generation: {response_content}")
+        
+        # Parse the JSON array from the LLM response
+        try:
+            # Clean the response to handle potential formatting issues
+            cleaned_content = response_content.strip()
+            # If the response is wrapped in ```json and ``` tags, remove them
+            if cleaned_content.startswith("```json"):
+                cleaned_content = cleaned_content.replace("```json", "", 1)
+                if cleaned_content.endswith("```"):
+                    cleaned_content = cleaned_content[:-3]
+            elif cleaned_content.startswith("```"):
+                cleaned_content = cleaned_content.replace("```", "", 1)
+                if cleaned_content.endswith("```"):
+                    cleaned_content = cleaned_content[:-3]
+            
+            # Parse the JSON array
+            parsed_queries = json.loads(cleaned_content)
+            
+            if isinstance(parsed_queries, list) and len(parsed_queries) > 0:
+                # Use the LLM-generated queries
+                search_queries = [SearchQuery(query=q) for q in parsed_queries]
+                logger.info(f"Successfully parsed {len(search_queries)} search queries from LLM response")
+            else:
+                # Fallback if the parsed result is not a list or is empty
+                logger.warning(f"Parsed queries is not a valid list: {parsed_queries}. Using original query.")
+                search_queries = [SearchQuery(query=query)]
+        except json.JSONDecodeError as json_err:
+            logger.warning(f"Failed to parse LLM response as JSON: {json_err}. Using original query.")
+            search_queries = [SearchQuery(query=query)]
+        except Exception as parsing_err:
+            logger.warning(f"Error parsing search queries: {parsing_err}. Using original query.")
+            search_queries = [SearchQuery(query=query)]
+        
+        # Log the search queries being used
+        print(f"Search queries being used: {[sq.query for sq in search_queries]}")
+        
+        return {
+            "search_queries": search_queries
+        }
+        
+    except Exception as e:
+        # Log the error and return a safe default
+        print(f"Error in search query generation: {str(e)}")
+        return {
+            "search_queries": [SearchQuery(query=query)]
+        }
+
+@traceable
+async def execute_search(state: SearchState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Execute a search for a query using Google Search API.
+    
+    Args:
+        state: Current state with search query
+        config: Configuration for the function
+        
+    Returns:
+        Search results for the query
+    """
+    # Get search queries
+    search_queries = state.get("search_queries", [])
+    if not search_queries:
+        logger.warning("No search queries found in state")
+        return {"search_results": []}
+    
+    # Extract configuration
+    search_config = config.get("configurable", {})
+    max_results_per_query = search_config.get("max_results_per_query", 5)
+    
+    # Get the first query (parallel execution is handled by search_multiple_queries)
+    query = search_queries[0].query
+    
+    try:
+        logger.info(f"Executing search for query: {query}")
+        
+        # Get API key and search engine ID from environment variables
+        api_key = os.getenv("GOOGLE_API_KEY")
+        search_engine_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
+        
+        # Determine if we should use direct API call or wrapper
+        use_direct_api = api_key and search_engine_id
+        
+        if use_direct_api:
+            # Use direct API call to Google Custom Search API
+            return await execute_direct_search(query, api_key, search_engine_id, max_results_per_query, state)
+        else:
+            # Use LangChain wrapper
+            logger.info("Using LangChain wrapper for Google Search API (API key or search engine ID not set)")
+            return await execute_wrapper_search(query, max_results_per_query, state)
+            
+    except Exception as e:
+        logger.error(f"Error executing search for query '{query}': {str(e)}")
+        logger.exception("Exception details:")
+        
+        # Try to fall back to the wrapper if there was an error with direct API call
+        try:
+            logger.info("Falling back to LangChain wrapper due to exception")
+            return await execute_wrapper_search(query, max_results_per_query, state)
+        except Exception as wrapper_e:
+            logger.error(f"Error in wrapper fallback: {str(wrapper_e)}")
+            return {
+                "search_results": [[]],
+                "is_parallel_branch": state.get("is_parallel_branch", False),
+                "all_queries_processed": state.get("all_queries_processed", False)
+            }
+
+async def execute_direct_search(query, api_key, search_engine_id, max_results_per_query, state):
+    """Execute a search using direct API call to Google Custom Search API"""
+    logger.info("Making direct API call to Google Custom Search API")
+    
+    try:
+        # Build the API URL
+        url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={search_engine_id}&q={query}&num={max_results_per_query}"
+        
+        # Make the API request
+        response = requests.get(url)
+        
+        if response.status_code != 200:
+            logger.error(f"API request failed with status code: {response.status_code}")
+            logger.error(f"Response: {response.text}")
+            # Fall back to the wrapper if the direct API call fails
+            logger.info("Falling back to LangChain wrapper due to API error")
+            return await execute_wrapper_search(query, max_results_per_query, state)
+        
+        # Parse the JSON response
+        data = response.json()
+        
+        # Log the response structure for debugging
+        logger.info(f"Google Search API direct response structure: {list(data.keys())}")
+        
+        # Check for spelling correction
+        original_query = query
+        if "spelling" in data and "correctedQuery" in data["spelling"]:
+            corrected_query = data["spelling"]["correctedQuery"]
+            logger.info(f"Google suggested spelling correction: '{original_query}' -> '{corrected_query}'")
+            
+            # Execute a new search with the corrected query
+            logger.info(f"Re-executing search with corrected query: {corrected_query}")
+            
+            # Build the API URL with the corrected query
+            corrected_url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={search_engine_id}&q={corrected_query}&num={max_results_per_query}"
+            
+            # Make the API request with the corrected query
+            corrected_response = requests.get(corrected_url)
+            
+            if corrected_response.status_code == 200:
+                # Use the corrected response
+                data = corrected_response.json()
+                # Update the query to the corrected version for metadata
+                query = corrected_query
+                logger.info(f"Successfully retrieved results for corrected query: {corrected_query}")
+            else:
+                logger.warning(f"Failed to get results for corrected query. Status code: {corrected_response.status_code}")
+                # Continue with the original response
+        
+        # Process the search results
+        search_results = []
+        
+        # Extract items from the response
+        if "items" in data:
+            raw_results = data["items"]
+            logger.info(f"Found {len(raw_results)} items in response")
+            
+            # Process each result
+            for i, result in enumerate(raw_results):
+                if "link" in result:
+                    # Create SearchResult object
+                    search_result = SearchResult(
+                        title=result.get("title", ""),
+                        url=result.get("link", ""),
+                        snippet=result.get("snippet", ""),
+                        metadata={
+                            "source": "google",
+                            "position": i + 1,  # Use index+1 as position
+                            "query": query,  # Add the query that produced this result
+                            "original_query": original_query if query != original_query else None
+                        }
+                    )
+                    search_results.append(search_result)
+        else:
+            logger.warning("No items found in the API response")
+        
+        logger.info(f"Processed {len(search_results)} valid results for query: {query}")
+        
+        # Return the search results and preserve state flags
+        return {
+            "search_results": [search_results],
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in direct API call: {str(e)}")
+        logger.exception("Exception details:")
+        # Fall back to the wrapper
+        logger.info("Falling back to LangChain wrapper due to exception in direct API call")
+        return await execute_wrapper_search(query, max_results_per_query, state)
+
+async def execute_wrapper_search(query, max_results_per_query, state):
+    """Execute a search using the LangChain wrapper"""
+    logger.info(f"Using LangChain wrapper for query: {query}")
+    
+    try:
+        # Execute search using Google Search API wrapper
+        response = google_search.results(query, max_results_per_query)
+        
+        # Log the response type for debugging
+        logger.info(f"Wrapper response type: {type(response)}")
+        
+        # Process the search results
+        search_results = []
+        
+        # Handle different response structures
+        if isinstance(response, dict) and "items" in response:
+            # Standard Google Search API response format
+            raw_results = response.get("items", [])
+            logger.info(f"Found {len(raw_results)} items in wrapper response dictionary")
+        elif isinstance(response, list):
+            # API directly returned a list of results
+            raw_results = response
+            logger.info(f"Wrapper response is a list with {len(raw_results)} items")
+        else:
+            # Default case, try to use the response as is
+            logger.warning(f"Unexpected wrapper response type: {type(response)}")
+            raw_results = []
+            
+        # Process each result
+        for i, result in enumerate(raw_results):
+            if isinstance(result, dict) and "link" in result:
+                # Create SearchResult object
+                search_result = SearchResult(
+                    title=result.get("title", ""),
+                    url=result.get("link", ""),
+                    snippet=result.get("snippet", ""),
+                    metadata={
+                        "source": "google",
+                        "position": i + 1,  # Use index+1 as position
+                        "query": query  # Add the query that produced this result
+                    }
+                )
+                search_results.append(search_result)
+        
+        logger.info(f"Processed {len(search_results)} valid results from wrapper for query: {query}")
+        
+        # Return the search results and preserve state flags
+        return {
+            "search_results": [search_results],
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+    except Exception as e:
+        logger.error(f"Error in wrapper search: {str(e)}")
+        logger.exception("Exception details:")
+        return {
+            "search_results": [[]],
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+
+@traceable
+def search_multiple_queries(state: SearchState) -> List[Send]:
+    """
+    Create parallel tasks for executing multiple search queries.
+    
+    Args:
+        state: Current state with search queries
+        
+    Returns:
+        List of Send objects for parallel execution
+    """
+    # Check if we've already processed all queries
+    # This is a safety check to prevent infinite loops
+    if state.get("all_queries_processed", False):
+        logger.info("All queries have already been processed, skipping parallelization")
+        return []
+    
+    search_queries = state.get("search_queries", [])
+    
+    if not search_queries:
+        logger.info("No search queries to execute in parallel")
+        return []
+    
+    # Check if we're already in a parallel execution branch
+    # If this is a parallel branch, don't create more parallel tasks to avoid infinite recursion
+    if state.get("is_parallel_branch", False):
+        logger.info("Already in a parallel branch, skipping further parallelization")
+        return []
+    
+    # Create parallel tasks for each query
+    parallel_tasks = []
+    
+    # If we only have one query, no need for parallel execution
+    if len(search_queries) <= 1:
+        logger.info("Only one query available, no need for parallel execution")
+        # Mark all queries as processed to prevent further parallelization
+        state["all_queries_processed"] = True
+        return []
+    
+    # Process all queries in parallel - no need to skip the first one
+    # This is more efficient as we don't need to execute the first query twice
+    # Limit the number of parallel queries to prevent overloading
+    max_parallel_queries = min(len(search_queries), 5)  # Maximum 5 parallel queries
+    
+    for i in range(max_parallel_queries):
+        if i >= len(search_queries):
+            break
+            
+        query = search_queries[i]
+        logger.info(f"Creating parallel task for query: {query.query}")
+        
+        # Create a new state with just this query and mark it as a parallel branch
+        new_state = {
+            "search_queries": [query],
+            "is_parallel_branch": True,  # Mark this as a parallel branch to prevent further recursion
+            "all_queries_processed": True  # Mark as all processed to prevent further parallelization
+        }
+        
+        # Add to parallel tasks
+        parallel_tasks.append(Send("execute_search", new_state))
+    
+    # Mark all queries as processed to prevent further parallelization in the main branch
+    state["all_queries_processed"] = True
+    
+    logger.info(f"Created {len(parallel_tasks)} parallel search tasks")
+    return parallel_tasks
+
+@traceable
+def process_search_results(state: SearchState) -> Dict[str, Any]:
+    """
+    Process search results from multiple queries, removing duplicates and ranking by relevance.
+    
+    Args:
+        state: Current state with search results
+        
+    Returns:
+        Processed and ranked sources
+    """
+    # Get search results from state
+    search_results_lists = state.get("search_results", [])
+    
+    # If there are no search results yet and this is not a parallel branch,
+    # we need to wait for results from parallel executions
+    if not search_results_lists and not state.get("is_parallel_branch", False):
+        logger.info("No search results yet, waiting for parallel executions to complete")
+        return {
+            "processed_sources": [],
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+    
+    # Flatten the list of lists into a single list of results
+    all_results = []
+    for results_list in search_results_lists:
+        all_results.extend(results_list)
+    
+    logger.info(f"Processing {len(all_results)} total results from all queries")
+    
+    # Deduplicate results by URL
+    # If the same URL appears multiple times, keep the one with the highest position (lowest number)
+    # and track which queries found this result
+    url_to_best_result = {}
+    
+    for result in all_results:
+        url = result.url
+        position = result.metadata.get("position", 999)  # Default to a high position if not specified
+        query = result.metadata.get("query", "")
+        
+        if url in url_to_best_result:
+            # URL already exists, check if this result has a better position
+            existing_result = url_to_best_result[url]
+            existing_position = existing_result.metadata.get("position", 999)
+            
+            # Update the existing result if this one has a better position
+            if position < existing_position:
+                # Keep the better-positioned result but preserve the query information
+                existing_queries = existing_result.metadata.get("queries", [existing_result.metadata.get("query", "")])
+                if query not in existing_queries:
+                    existing_queries.append(query)
+                
+                # Update the result with the better position and combined queries
+                result.metadata["queries"] = existing_queries
+                url_to_best_result[url] = result
+            else:
+                # Keep the existing result but add this query to its metadata
+                existing_queries = existing_result.metadata.get("queries", [existing_result.metadata.get("query", "")])
+                if query not in existing_queries:
+                    existing_queries.append(query)
+                existing_result.metadata["queries"] = existing_queries
+        else:
+            # New URL, add it to the dictionary
+            # Initialize the queries list with this query
+            result.metadata["queries"] = [query]
+            url_to_best_result[url] = result
+    
+    # Convert back to a list and sort by relevance
+    processed_results = list(url_to_best_result.values())
+    
+    # Calculate a relevance score for each result
+    # Factors: position in search results, number of queries that found this result
+    for result in processed_results:
+        position = result.metadata.get("position", 999)
+        queries = result.metadata.get("queries", [])
+        num_queries = len(queries)
+        
+        # Calculate relevance score:
+        # - Higher score for results found by multiple queries
+        # - Higher score for results with better position
+        # Position is inverted (10 - position) so that higher positions get higher scores
+        # Limited to a minimum of 1 to avoid negative scores
+        position_score = max(1, 10 - position)
+        query_score = num_queries * 3  # Weight for being found by multiple queries
+        
+        relevance_score = position_score + query_score
+        result.metadata["relevance_score"] = relevance_score
+    
+    # Sort by relevance score (descending)
+    processed_results.sort(key=lambda x: x.metadata.get("relevance_score", 0), reverse=True)
+    
+    # Convert to dictionaries for the state
+    processed_sources = []
+    for result in processed_results:
+        processed_sources.append({
+            "title": result.title,
+            "url": result.url,
+            "snippet": result.snippet,
+            "metadata": result.metadata
+        })
+    
+    logger.info(f"Processed {len(processed_sources)} unique sources after deduplication")
+    
+    return {
+        "processed_sources": processed_sources,
+        # Preserve flags to maintain state across nodes
+        "is_parallel_branch": state.get("is_parallel_branch", False),
+        "all_queries_processed": state.get("all_queries_processed", False)
+    }
+
+@traceable
+def select_relevant_results(state: SearchState) -> Dict[str, Any]:
+    """
+    Use LLM to select the most relevant search results for answering the user's query.
+    
+    Args:
+        state: Current state with processed sources
+        
+    Returns:
+        Updated state with selected relevant sources
+    """
+    # Skip in parallel branches
+    if state.get("is_parallel_branch", False):
+        logger.info("Skipping result selection in parallel branch")
+        return {
+            "selected_sources": [],
+            "is_parallel_branch": True,
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+    
+    original_query = state["query"]
+    processed_sources = state.get("processed_sources", [])
+    
+    if not processed_sources:
+        logger.warning("No processed sources found for selection")
+        return {"selected_sources": []}
+    
+    logger.info(f"Selecting most relevant results from {len(processed_sources)} sources")
+    
+    # Prepare the content for the LLM
+    sources_text = ""
+    for i, source in enumerate(processed_sources):
+        sources_text += f"\nSource {i+1}: {source.get('title', 'Untitled')}\n"
+        sources_text += f"URL: {source.get('url', 'No URL')}\n"
+        sources_text += f"Snippet: {source.get('snippet', 'No snippet')}\n"
+        # Include relevance score and which queries found this result
+        metadata = source.get("metadata", {})
+        queries = metadata.get("queries", [])
+        sources_text += f"Found by queries: {', '.join(queries)}\n"
+        sources_text += f"Relevance score: {metadata.get('relevance_score', 0)}\n"
+    
+    # System prompt for result selection - improved for clarity
+    system_prompt = """
+    You are an expert search result curator. Your task is to select the most relevant search results 
+    that will best help answer the user's original query.
+    
+    Guidelines:
+    1. Select up to 5 search results that collectively provide the most comprehensive answer
+    2. Prioritize results that directly address the main aspects of the query
+    3. Ensure diversity of information and perspectives
+    4. Consider both the relevance score and the content of each result
+    5. Avoid selecting redundant or duplicate information
+    
+    CRITICAL FORMATTING INSTRUCTION:
+    Your ENTIRE response must be ONLY the numbers of the selected sources in a comma-separated list.
+    
+    VALID EXAMPLES:
+    "1,3,5"
+    "2,4"
+    "3"
+    
+    INVALID EXAMPLES:
+    "Sources 1, 3, and 5 are most relevant."
+    "I recommend sources: 1,3,5"
+    "The best sources are 1,3,5"
+    
+    DO NOT include any explanation, reasoning, or additional text.
+    DO NOT include any other characters besides numbers and commas.
+    """
+    
+    try:
+        # Use Azure OpenAI for result selection
+        response = azure_openai.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"""
+            Original User Query: {original_query}
+            
+            Available Search Results:
+            {sources_text}
+            
+            TASK: Select up to 5 most relevant sources that will best answer the query.
+            
+            RESPONSE FORMAT: Return ONLY source numbers separated by commas.
+            
+            Examples of correct responses:
+            1,3,5
+            2,4
+            3
+            
+            Your response must contain ONLY numbers and commas, nothing else.
+            """)
+        ])
+        
+        # Get the response content and parse the selected source numbers
+        selection_text = response.content.strip()
+        logger.info(f"LLM selection response: '{selection_text}'")
+        
+        # Parse the comma-separated list of source numbers
+        try:
+            # Handle potential formatting issues in the response
+            # Extract all numbers from the response using regex
+            import re
+            numbers = re.findall(r'\d+', selection_text)
+            
+            if not numbers:
+                logger.warning(f"No numbers found in LLM response: '{selection_text}'")
+                # Fall back to top 5 by relevance score
+                processed_sources.sort(key=lambda x: x.get("metadata", {}).get("relevance_score", 0), reverse=True)
+                selected_sources = processed_sources[:min(5, len(processed_sources))]
+                logger.info(f"Falling back to top {len(selected_sources)} sources by relevance score")
+            else:
+                # Convert to integers and adjust to 0-based indices
+                selected_indices = [int(num) - 1 for num in numbers]
+                
+                # Validate indices are within range
+                valid_indices = [idx for idx in selected_indices if 0 <= idx < len(processed_sources)]
+                
+                if not valid_indices:
+                    logger.warning("Selected indices out of range, using top 5 by relevance")
+                    # Fall back to top 5 by relevance score
+                    processed_sources.sort(key=lambda x: x.get("metadata", {}).get("relevance_score", 0), reverse=True)
+                    selected_sources = processed_sources[:min(5, len(processed_sources))]
+                else:
+                    # Get the selected sources
+                    selected_sources = [processed_sources[idx] for idx in valid_indices]
+                    logger.info(f"LLM selected {len(selected_sources)} sources: indices {[idx+1 for idx in valid_indices]}")
+        
+        except Exception as e:
+            logger.error(f"Error parsing LLM selection response: {str(e)}")
+            # Fall back to top 5 by relevance score
+            processed_sources.sort(key=lambda x: x.get("metadata", {}).get("relevance_score", 0), reverse=True)
+            selected_sources = processed_sources[:min(5, len(processed_sources))]
+            logger.info(f"Falling back to top {len(selected_sources)} sources by relevance score due to parsing error")
+        
+        # If we somehow ended up with no selected sources, use top by relevance as fallback
+        if not selected_sources:
+            processed_sources.sort(key=lambda x: x.get("metadata", {}).get("relevance_score", 0), reverse=True)
+            selected_sources = processed_sources[:min(5, len(processed_sources))]
+            logger.info(f"No sources selected, falling back to top {len(selected_sources)} by relevance")
+        
+        return {
+            "selected_sources": selected_sources,
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in result selection: {str(e)}")
+        # Fall back to top 5 by relevance score
+        processed_sources.sort(key=lambda x: x.get("metadata", {}).get("relevance_score", 0), reverse=True)
+        selected_sources = processed_sources[:min(5, len(processed_sources))]
+        logger.info(f"Falling back to top {len(selected_sources)} sources by relevance score due to error")
+        
+        return {
+            "selected_sources": selected_sources,
+            "is_parallel_branch": state.get("is_parallel_branch", False),
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+
+@traceable
+def extract_content(state: SearchState) -> Dict[str, Any]:
+    """
+    Extract content from selected sources.
+    
+    Args:
+        state: Current state with selected sources
+        
+    Returns:
+        Updated state with extracted content
+    """
+    # Skip content extraction in parallel branches to avoid duplicate processing
+    if state.get("is_parallel_branch", False):
+        logger.info("Skipping content extraction in parallel branch")
+        return {
+            "extracted_content": [],
+            "is_parallel_branch": True,
+            "all_queries_processed": state.get("all_queries_processed", False)
+        }
+    
+    # Use selected sources instead of processed sources
+    selected_sources = state.get("selected_sources", [])
+    if not selected_sources:
+        logger.warning("No selected sources found in state")
+        return {"extracted_content": []}
+    
+    logger.info(f"Extracting content from {len(selected_sources)} selected sources")
+    
+    # In a real implementation, this would fetch the actual content from each URL
+    # For now, we'll use the snippets as the content
+    extracted_content = []
+    for source in selected_sources:
+        # In a production system, we would:
+        # 1. Fetch the HTML content from the URL
+        # 2. Parse the HTML to extract the main content
+        # 3. Clean and format the content
+        
+        # For this implementation, we'll use the snippet as the content
+        content = source.get("snippet", "")
+        
+        extracted_content.append({
+            "title": source.get("title", ""),
+            "url": source.get("url", ""),
+            "snippet": source.get("snippet", ""),
+            "content": content,
+            "metadata": source.get("metadata", {})
+        })
+    
+    logger.info(f"Extracted content from {len(extracted_content)} sources")
+    
+    return {
+        "extracted_content": extracted_content,
+        "is_parallel_branch": state.get("is_parallel_branch", False),
+        "all_queries_processed": state.get("all_queries_processed", False)
+    }
+
+@traceable
+def generate_response(state: SearchState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Generate a comprehensive response based on extracted content using Azure OpenAI.
+    
+    Args:
+        state: Current state with extracted content
+        config: Configuration for the function
+        
+    Returns:
+        Updated state with generated response
+    """
+    # Skip response generation in parallel branches to avoid duplicate responses
+    if state.get("is_parallel_branch", False):
+        logger.info("Skipping response generation in parallel branch")
+        return {
+            "response": "",  # Empty string for parallel branches
+            "sources": []    # Empty list for parallel branches
+        }
+    
+    query = state["query"]
+    extracted_content = state.get("extracted_content", [])
+    
+    # Prepare the content for the LLM
+    content_text = ""
+    sources = []
+    
+    for i, content in enumerate(extracted_content):
+        content_text += f"\nSource {i+1}: {content.get('title', 'Untitled')}\n"
+        content_text += f"URL: {content.get('url', 'No URL')}\n"
+        content_text += f"Content: {content.get('content', 'No content')}\n"
+        
+        # Track sources for citation
+        sources.append({
+            "id": i+1,
+            "title": content.get("title", "Untitled"),
+            "url": content.get("url", "No URL"),
+            "snippet": content.get("snippet", "")
+        })
+    
+    # System prompt for response generation
+    system_prompt = """
+    You are a helpful search assistant. Your task is to generate a comprehensive, accurate, and informative 
+    response to the user's query based on the provided search results.
+    
+    Guidelines:
+    1. Provide a direct and complete answer to the user's question
+    2. Synthesize information from multiple sources when relevant
+    3. Include specific facts, figures, and details from the sources
+    4. Maintain objectivity and present different perspectives when appropriate
+    5. Use clear, concise language appropriate for the topic
+    6. Cite your sources using [1], [2], etc. corresponding to the source numbers
+    7. If the sources don't contain relevant information, acknowledge the limitations
+    
+    Format your response in markdown with appropriate headings, lists, and emphasis.
+    """
+    
+    # Use Azure OpenAI for response generation
+    try:
+        response = azure_openai.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=f"""
+            User Query: {query}
+            
+            Search Results:
+            {content_text}
+            
+            Generate a comprehensive response to the user's query based on these search results.
+            """)
+        ])
+        
+        # Get the response content
+        response_text = response.content
+        
+        # For simplicity in this placeholder, we'll return a basic response
+        # In a real implementation, you would use the actual LLM response
+        if not extracted_content:
+            response_text = f"I couldn't find specific information about '{query}'. Please try refining your search or ask a different question."
+        
+        return {
+            "response": response_text,
+            "sources": sources
+        }
+        
+    except Exception as e:
+        # Log the error and return a safe default
+        logger.error(f"Error in response generation: {str(e)}")
+        return {
+            "response": f"I encountered an error while generating a response for '{query}'. Please try again later.",
+            "sources": sources
+        }
+
+@traceable
+def format_response(state: SearchState) -> Dict[str, Any]:
+    """
+    Format the response with sources.
+    
+    Args:
+        state: Current state with response and sources
+        
+    Returns:
+        Formatted response with sources
+    """
+    response = state.get("response", "")
+    sources = state.get("sources", [])
+    
+    formatted_response = response
+    
+    # Add sources section if there are sources
+    if sources:
+        formatted_response += "\n\n## Sources\n\n"
+        for i, source in enumerate(sources):
+            formatted_response += f"{i+1}. [{source.get('title', 'Untitled')}]({source.get('url', '')})\n"
+    
+    logger.info("Response formatting complete")
+    
+    # Since response and sources are annotated with operator.add, we need to return empty strings/lists
+    # for parallel branches to avoid duplicating content
+    if state.get("is_parallel_branch", False):
+        return {
+            "response": "",  # Empty string for parallel branches
+            "sources": []    # Empty list for parallel branches
+        }
+    else:
+        return {
+            "response": formatted_response,
+            "sources": sources
+        }
+
+# ------------------------------------------------------------
+# Graph construction
+
+@traceable
+def create_search_graph() -> StateGraph:
+    """
+    Create the search graph.
+    
+    Returns:
+        StateGraph: The compiled search graph
+    """
+    # Create a new graph
+    builder = StateGraph(SearchState)
+    
+    # Add nodes
+    builder.add_node("moderate_content", moderate_content)
+    builder.add_node("generate_search_queries", generate_search_queries)
+    builder.add_node("execute_search", execute_search)
+    builder.add_node("process_search_results", process_search_results)
+    builder.add_node("select_relevant_results", select_relevant_results)
+    builder.add_node("extract_content", extract_content)
+    builder.add_node("generate_response", generate_response)
+    builder.add_node("format_response", format_response)
+    
+    # Add edges
+    builder.add_edge(START, "moderate_content")
+    
+    # Conditional edge based on moderation result
+    builder.add_conditional_edges(
+        "moderate_content",
+        lambda state: "generate_search_queries" if state["moderation_result"]["is_safe"] else END
+    )
+    
+    # After generating search queries, directly create parallel tasks for all queries
+    # This eliminates the redundant search in the main flow
+    builder.add_conditional_edges(
+        "generate_search_queries",
+        lambda state: search_multiple_queries(state) if not state.get("all_queries_processed", False) else ["process_search_results"],
+        ["execute_search"]
+    )
+    
+    # Direct connection from execute_search to process_search_results
+    builder.add_edge("execute_search", "process_search_results")
+    builder.add_edge("process_search_results", "select_relevant_results")
+    builder.add_edge("select_relevant_results", "extract_content")
+    builder.add_edge("extract_content", "generate_response")
+    builder.add_edge("generate_response", "format_response")
+    builder.add_edge("format_response", END)
+    
+    # Compile the graph
+    return builder.compile()
+
+# ------------------------------------------------------------
+# Main function
+
+async def main():
+    """
+    Main function to demonstrate the search engine.
+    """
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Search Engine Demo")
+    parser.add_argument("query", type=str, help="Search query")
+    args = parser.parse_args()
+    
+    # Create search config
+    config = SearchConfig()
+    
+    # Create search graph
+    search_graph = create_search_graph()
+    
+    # Create initial state
+    initial_state = {
+        "query": args.query
+    }
+    
+    # Run the search graph
+    logger.info(f"Running search for query: {args.query}")
+    result = await search_graph.ainvoke(
+        initial_state,
+        config=config.get_runnable_config()
+    )
+    
+    # Print the result
+    print("\n" + "="*80)
+    print(f"Search Results for: {args.query}")
+    print("="*80)
+    print(result["response"])
+    print("="*80)
+    
+    return result
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
